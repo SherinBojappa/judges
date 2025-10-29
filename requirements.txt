@@ -4,3 +4,4 @@ transformers
 trl
 datasets
 bitsandbytes
+wandb
