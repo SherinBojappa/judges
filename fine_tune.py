@@ -1,5 +1,6 @@
 """
-Fine-tuning script for Qwen model with medical reasoning dataset
+Fine-tuning script for language models (OLMoE, Qwen, etc.) with medical reasoning dataset
+Supports loading specific model checkpoints/revisions via command-line arguments
 Converted from finetuning_qwen.ipynb
 """
 
@@ -15,9 +16,8 @@ from transformers import TrainingArguments
 import gc
 import logging
 import wandb
-import logging
-import wandb
 from datetime import datetime
+import argparse
 
 
 # Setup logging
@@ -54,10 +54,17 @@ def setup_huggingface_auth():
     logger.info("Successfully authenticated with Hugging Face")
 
 
-def load_model_and_tokenizer(model_dir="Qwen/Qwen3-8B"):
-    """Load the model and tokenizer with quantization config"""
+def load_model_and_tokenizer(model_dir="allenai/OLMoE-1B-7B-0924", revision=None):
+    """Load the model and tokenizer with quantization config
+
+    Args:
+        model_dir: The model identifier or path (e.g., "allenai/OLMoE-1B-7B-0924")
+        revision: The specific model version/revision to load (e.g., "main", commit hash, tag, or branch name)
+                 If None, uses the default branch (usually "main")
+    """
     logger = logging.getLogger(__name__)
-    logger.info(f"Loading model and tokenizer from {model_dir}...")
+    revision_info = f" (revision: {revision})" if revision else ""
+    logger.info(f"Loading model and tokenizer from {model_dir}{revision_info}...")
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -66,17 +73,25 @@ def load_model_and_tokenizer(model_dir="Qwen/Qwen3-8B"):
         bnb_4bit_compute_dtype=torch.bfloat16,
     )
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, use_fast=True)
+    # Load tokenizer with optional revision
+    tokenizer_kwargs = {"use_fast": True, "trust_remote_code": True}
+    if revision:
+        tokenizer_kwargs["revision"] = revision
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, **tokenizer_kwargs)
     logger.info("Tokenizer loaded successfully")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    logger.info("Model loaded successfully with 4-bit quantization")
+    # Load model with optional revision
+    model_kwargs = {
+        "quantization_config": bnb_config,
+        "device_map": "auto",
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": True,
+    }
+    if revision:
+        model_kwargs["revision"] = revision
+
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **model_kwargs)
+    logger.info(f"Model loaded successfully with 4-bit quantization{revision_info}")
 
     model.config.use_cache = False
 
@@ -138,7 +153,7 @@ def formatting_prompts_func(examples, tokenizer, train_prompt_style):
     return {"text": texts}
 
 
-def load_and_prepare_dataset(tokenizer, train_prompt_style):
+def load_and_prepare_dataset(tokenizer, train_prompt_style, dataset_size=2000):
     """Load and prepare the dataset"""
     logger = logging.getLogger(__name__)
     logger.info("Loading dataset from FreedomIntelligence/medical-o1-reasoning-SFT...")
@@ -146,7 +161,7 @@ def load_and_prepare_dataset(tokenizer, train_prompt_style):
     dataset = load_dataset(
         "FreedomIntelligence/medical-o1-reasoning-SFT",
         "en",
-        split="train[0:2000]",
+        split=f"train[0:{dataset_size}]",
         trust_remote_code=True,
     )
     logger.info(f"Dataset loaded with {len(dataset)} examples")
@@ -215,7 +230,7 @@ def setup_peft_model(model):
     return model, peft_config
 
 
-def setup_trainer(model, tokenizer, dataset, peft_config):
+def setup_trainer(model, tokenizer, dataset, peft_config, output_dir="output"):
     """Setup the training arguments and trainer"""
     logger = logging.getLogger(__name__)
     logger.info("Setting up trainer...")
@@ -223,7 +238,7 @@ def setup_trainer(model, tokenizer, dataset, peft_config):
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
     training_arguments = TrainingArguments(
-        output_dir="output",
+        output_dir=output_dir,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
         gradient_accumulation_steps=2,
@@ -286,19 +301,59 @@ def push_model_to_hub(model, tokenizer, new_model_name="Qwen-3-32B-Medical-Reaso
     logger.info("Tokenizer pushed successfully")
 
 
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Fine-tune OLMoE or other models with medical reasoning dataset"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="allenai/OLMoE-1B-7B-0924",
+        help="Model identifier from HuggingFace Hub (default: allenai/OLMoE-1B-7B-0924)",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Specific model revision/checkpoint to load (e.g., commit hash, tag, or branch name). If not specified, uses the default branch.",
+    )
+    parser.add_argument(
+        "--dataset-size",
+        type=int,
+        default=2000,
+        help="Number of examples to use from the dataset (default: 2000)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="output",
+        help="Output directory for model checkpoints (default: output)",
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main execution function"""
+    # Parse arguments
+    args = parse_args()
+
     # Setup logging
     logger = setup_logging()
     logger.info("=" * 50)
-    logger.info("Starting Qwen Medical Fine-tuning Pipeline")
+    logger.info("Starting Medical Fine-tuning Pipeline")
     logger.info("=" * 50)
+    logger.info(f"Model: {args.model}")
+    if args.revision:
+        logger.info(f"Revision: {args.revision}")
+    logger.info(f"Dataset size: {args.dataset_size}")
 
     # Setup WandB configuration
     wandb_config = {
-        "model": "Qwen/Qwen3-8B",
+        "model": args.model,
+        "model_revision": args.revision,
         "dataset": "FreedomIntelligence/medical-o1-reasoning-SFT",
-        "dataset_size": 2000,
+        "dataset_size": args.dataset_size,
         "lora_r": 64,
         "lora_alpha": 16,
         "lora_dropout": 0.05,
@@ -317,14 +372,18 @@ def main():
     # setup_huggingface_auth()
 
     # Load model and tokenizer
-    model, tokenizer = load_model_and_tokenizer()
+    model, tokenizer = load_model_and_tokenizer(
+        model_dir=args.model, revision=args.revision
+    )
 
     # Get prompt templates
     train_prompt_style = get_train_prompt_style()
     inference_prompt_style = get_inference_prompt_style()
 
     # Load and prepare dataset
-    dataset = load_and_prepare_dataset(tokenizer, train_prompt_style)
+    dataset = load_and_prepare_dataset(
+        tokenizer, train_prompt_style, dataset_size=args.dataset_size
+    )
 
     # Log dataset sample to WandB
     wandb.log({"sample_text": dataset["text"][10]})
@@ -347,7 +406,9 @@ def main():
     model, peft_config = setup_peft_model(model)
 
     # Setup trainer
-    trainer = setup_trainer(model, tokenizer, dataset, peft_config)
+    trainer = setup_trainer(
+        model, tokenizer, dataset, peft_config, output_dir=args.output_dir
+    )
 
     # Train the model
     logger.info("\n" + "=" * 50)
